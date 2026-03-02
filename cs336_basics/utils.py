@@ -5,6 +5,10 @@ import math
 from typing import Iterable
 import numpy as np
 from numpy.typing import NDArray
+from cs336_basics.MyTransformerLM import MyTransformerLM
+from cs336_basics.MyAdamW import MyAdamW
+import os
+import argparse
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     """
@@ -167,3 +171,40 @@ def load_checkpoint(src, model, optimizer):
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     iteration = checkpoint['iteration']
     return iteration
+
+def train():
+    parser = argparse.ArgumentParser(description="Train a Transformer language model.")
+    # ==========================================
+    # 1. 模型架构超参数 (Model Hyperparameters)
+    # ==========================================
+    parser.add_argument("--vocab_size", type=int, default=10000, help="词表大小")
+    parser.add_argument("--context_length", type=int, default=256, help="上下文长度 (m)")
+    parser.add_argument("--d_model", type=int, default=512, help="Transformer 隐藏层维度")
+    parser.add_argument("--num_layers", type=int, default=4, help="Transformer 块的数量")
+    parser.add_argument("--num_heads", type=int, default=16, help="多头注意力的头数")
+
+    # ==========================================
+    # 2. 训练超参数 (Training Hyperparameters)
+    # ==========================================
+    parser.add_argument("--batch_size", type=int, default=32, help="批次大小")
+    parser.add_argument("--learning_rate", type=float, default=5e-4, help="最大学习率")
+    parser.add_argument("--max_iters", type=int, default=5000, help="最大训练迭代步数")
+    parser.add_argument("--device", type=str, default="cuda:0", help="训练设备 (cuda:0, cpu, mps)")
+
+    # ==========================================
+    # 3. 数据与 Checkpoint (5.2节的核心)
+    # ==========================================
+    parser.add_argument("--data_path", type=str, required=True, help="预训练数据的路径 (.npy 或 .bin)")
+    parser.add_argument("--out_dir", type=str, default="checkpoints", help="保存 checkpoint 的文件夹路径")
+    parser.add_argument("--resume_from", type=str, default=None, help="如果中断了，指定一个 .pt 文件的路径来恢复训练")
+    parser.add_argument("--save_interval", type=int, default=500, help="每隔多少步保存一次 checkpoint")
+    model = MyTransformerLM(
+        vocab_size=10000,
+        context_length=128,
+        num_layers=4,
+        d_model=256,
+        num_heads=8,
+        d_ff=1024,
+        rope_theta=100000.0,
+        weights={}
+    )
