@@ -3,6 +3,8 @@ from torch import Tensor
 from jaxtyping import Float, Int
 import math
 from typing import Iterable
+import numpy as np
+from numpy.typing import NDArray
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     """
@@ -105,3 +107,33 @@ def gradient_clipping(parameters, max_norm: float, eps: float = 1e-6):
         for p in params_with_grad:
             # 在 PyTorch 中，带有下划线的方法 (如 .mul_()) 表示原位操作
             p.grad.detach().mul_(scale_factor)
+
+def get_batch(data:np.ndarray, batch_size, context_length,device='cuda:0'):
+    """
+    从输入序列 data 中随机采样一个批次的训练数据。
+    
+    参数:
+        data(np.array 或 np.memmap): 输入序列，形状为 (seq_length,)
+        batch_size(int): 批次大小
+        context_length(int): 上下文长度，即模型输入的序列长度
+        device(str): 设备字符串或 torch.device 对象
+    返回:
+        (x, y): 均为形状 (batch_size, context_length) 的 torch.Tensor，已移动到设备
+    """
+    # 1. 修复边界差一错误：randint 的上限是不包含 (exclusive) 的
+    # 最大允许的起始索引 i 必须满足：i + 1 + context_length <= len(data)
+    # 所以传入 randint 的 high 应该是 len(data) - context_length
+    ix = np.random.randint(0, len(data) - context_length, size=batch_size)
+    
+    # 2. 修复内存加载问题：针对 np.memmap 放弃高级索引，改用连续切片 (Slicing)
+    # 连续切片能最大化利用磁盘顺序读取和 OS 缓存，避免内存瞬间撑爆
+    x_list = [data[i : i + context_length].astype(np.int64) for i in ix]
+    y_list = [data[i + 1 : i + 1 + context_length].astype(np.int64) for i in ix]
+    
+    # 3. 转换为 Tensor、组合成 Batch 并移动到指定的 Device
+    x = torch.stack([torch.from_numpy(arr) for arr in x_list]).to(device)
+    y = torch.stack([torch.from_numpy(arr) for arr in y_list]).to(device)
+
+    return x, y
+
+def save_checkpoint(model, optimizer, iteration, out):
