@@ -137,3 +137,33 @@ def get_batch(data:np.ndarray, batch_size, context_length,device='cuda:0'):
     return x, y
 
 def save_checkpoint(model, optimizer, iteration, out):
+    """
+    保存模型检查点 (Checkpoint)。
+    参数:
+        model: 要保存的模型对象
+        optimizer: 模型对应的优化器对象
+        iteration: 当前的训练迭代次数 (int)
+        out: 保存文件的路径 (str)
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    torch.save(checkpoint, out)
+
+def load_checkpoint(src, model, optimizer):
+    """
+    从检查点文件加载模型和优化器状态。
+    参数:
+        src: 检查点文件的路径 (str)
+        model: 要加载状态的模型对象
+        optimizer: 要加载状态的优化器对象
+    返回:
+        iteration: 从检查点恢复的训练迭代次数 (int)
+    """
+    checkpoint = torch.load(src, map_location='cpu')  # 加载到 CPU 上，后续再移动到正确设备
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    iteration = checkpoint['iteration']
+    return iteration
