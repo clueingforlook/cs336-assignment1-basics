@@ -174,37 +174,174 @@ def load_checkpoint(src, model, optimizer):
 
 def train():
     parser = argparse.ArgumentParser(description="Train a Transformer language model.")
-    # ==========================================
-    # 1. 模型架构超参数 (Model Hyperparameters)
-    # ==========================================
-    parser.add_argument("--vocab_size", type=int, default=10000, help="词表大小")
-    parser.add_argument("--context_length", type=int, default=256, help="上下文长度 (m)")
-    parser.add_argument("--d_model", type=int, default=512, help="Transformer 隐藏层维度")
-    parser.add_argument("--num_layers", type=int, default=4, help="Transformer 块的数量")
-    parser.add_argument("--num_heads", type=int, default=16, help="多头注意力的头数")
+    # Model hyperparameters
+    parser.add_argument("--vocab_size", type=int, default=10000)
+    parser.add_argument("--context_length", type=int, default=256)
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--rope_theta", type=float, default=10000.0)
 
-    # ==========================================
-    # 2. 训练超参数 (Training Hyperparameters)
-    # ==========================================
-    parser.add_argument("--batch_size", type=int, default=32, help="批次大小")
-    parser.add_argument("--learning_rate", type=float, default=5e-4, help="最大学习率")
-    parser.add_argument("--max_iters", type=int, default=5000, help="最大训练迭代步数")
-    parser.add_argument("--device", type=str, default="cuda:0", help="训练设备 (cuda:0, cpu, mps)")
+    # Training hyperparameters
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--min_learning_rate", type=float, default=None)
+    parser.add_argument("--warmup_iters", type=int, default=200)
+    parser.add_argument("--max_iters", type=int, default=5000)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
+    parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--device", type=str, default="cuda:0")
 
-    # ==========================================
-    # 3. 数据与 Checkpoint (5.2节的核心)
-    # ==========================================
-    parser.add_argument("--data_path", type=str, required=True, help="预训练数据的路径 (.npy 或 .bin)")
-    parser.add_argument("--out_dir", type=str, default="checkpoints", help="保存 checkpoint 的文件夹路径")
-    parser.add_argument("--resume_from", type=str, default=None, help="如果中断了，指定一个 .pt 文件的路径来恢复训练")
-    parser.add_argument("--save_interval", type=int, default=500, help="每隔多少步保存一次 checkpoint")
+    # Data and checkpointing
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--data_dtype", type=str, default="uint16", choices=["uint16", "int32", "int64"])
+    parser.add_argument("--out_dir", type=str, default="checkpoints")
+    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--save_interval", type=int, default=500)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU.")
+        device = torch.device("cpu")
+    elif args.device == "mps" and not (torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False):
+        print("MPS not available, falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    if args.num_heads <= 0 or args.d_model % args.num_heads != 0:
+        raise ValueError("d_model must be divisible by num_heads.")
+    if args.max_iters <= 0:
+        raise ValueError("max_iters must be positive.")
+    if args.warmup_iters < 0:
+        raise ValueError("warmup_iters must be non-negative.")
+    if args.save_interval <= 0:
+        raise ValueError("save_interval must be positive.")
+    if args.log_interval <= 0:
+        raise ValueError("log_interval must be positive.")
+
+    min_learning_rate = args.min_learning_rate
+    if min_learning_rate is None:
+        min_learning_rate = args.learning_rate * 0.1
+
+    ext = os.path.splitext(args.data_path)[1].lower()
+    if ext == ".npy":
+        data = np.load(args.data_path, mmap_mode="r")
+    elif ext == ".bin":
+        dtype_map = {
+            "uint16": np.uint16,
+            "int32": np.int32,
+            "int64": np.int64,
+        }
+        data = np.memmap(args.data_path, dtype=dtype_map[args.data_dtype], mode="r")
+    else:
+        raise ValueError("data_path must end with .npy or .bin")
+
+    if data.ndim != 1:
+        raise ValueError("Training data must be a 1D token id array.")
+    if len(data) <= args.context_length:
+        raise ValueError("Training data is too short for the configured context_length.")
+
+    d_ff = 4 * args.d_model
+
+    def init_matrix(shape: tuple[int, ...]) -> Tensor:
+        t = torch.empty(shape, dtype=torch.float32)
+        torch.nn.init.xavier_uniform_(t)
+        return t
+
+    init_weights: dict[str, Tensor] = {
+        "token_embeddings.weight": init_matrix((args.vocab_size, args.d_model)),
+        "ln_final.weight": torch.ones(args.d_model, dtype=torch.float32),
+        "lm_head.weight": torch.nn.Parameter(init_matrix((args.vocab_size, args.d_model))),
+    }
+    for layer_idx in range(args.num_layers):
+        prefix = f"layers.{layer_idx}."
+        init_weights[prefix + "attn.q_proj.weight"] = init_matrix((args.d_model, args.d_model))
+        init_weights[prefix + "attn.k_proj.weight"] = init_matrix((args.d_model, args.d_model))
+        init_weights[prefix + "attn.v_proj.weight"] = init_matrix((args.d_model, args.d_model))
+        init_weights[prefix + "attn.output_proj.weight"] = init_matrix((args.d_model, args.d_model))
+        init_weights[prefix + "ln1.weight"] = torch.ones(args.d_model, dtype=torch.float32)
+        init_weights[prefix + "ln2.weight"] = torch.ones(args.d_model, dtype=torch.float32)
+        init_weights[prefix + "ffn.w1.weight"] = init_matrix((d_ff, args.d_model))
+        init_weights[prefix + "ffn.w2.weight"] = init_matrix((args.d_model, d_ff))
+        init_weights[prefix + "ffn.w3.weight"] = init_matrix((d_ff, args.d_model))
+
     model = MyTransformerLM(
-        vocab_size=10000,
-        context_length=128,
-        num_layers=4,
-        d_model=256,
-        num_heads=8,
-        d_ff=1024,
-        rope_theta=100000.0,
-        weights={}
+        vocab_size=args.vocab_size,
+        context_length=args.context_length,
+        num_layers=args.num_layers,
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        d_ff=d_ff,
+        rope_theta=args.rope_theta,
+        weights=init_weights,
     )
+    if not isinstance(model.lm_head, torch.nn.Parameter):
+        model.lm_head = torch.nn.Parameter(model.lm_head)
+    model = model.to(device)
+
+    # Keep references aligned because MyTransformerLM.forward reads from model.weights.
+    model.weights["token_embeddings.weight"] = model.embedding.weight
+    model.weights["ln_final.weight"] = model.ln_final.weight
+    model.weights["lm_head.weight"] = model.lm_head
+
+    optimizer = MyAdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+        eps=args.eps,
+    )
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    start_iter = 0
+    if args.resume_from is not None:
+        start_iter = load_checkpoint(args.resume_from, model, optimizer) + 1
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+        print(f"Resumed from {args.resume_from}, starting at step {start_iter}.")
+
+    model.train()
+    for step in range(start_iter, args.max_iters):
+        lr = lr_cosine_schedule(
+            t=step,
+            max_lr=args.learning_rate,
+            min_lr=min_learning_rate,
+            t_warm_up=args.warmup_iters,
+            t_c=args.max_iters,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+        x, y = get_batch(
+            data=data,
+            batch_size=args.batch_size,
+            context_length=args.context_length,
+            device=device,
+        )
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        if args.grad_clip > 0:
+            gradient_clipping(model.parameters(), args.grad_clip)
+        optimizer.step()
+
+        if (step + 1) % args.log_interval == 0 or step == start_iter:
+            print(f"step {step + 1}/{args.max_iters} | loss {loss.item():.6f} | lr {lr:.8f}")
+
+        if (step + 1) % args.save_interval == 0 or (step + 1) == args.max_iters:
+            ckpt_path = os.path.join(args.out_dir, f"checkpoint_step_{step + 1}.pt")
+            save_checkpoint(model=model, optimizer=optimizer, iteration=step, out=ckpt_path)
+            print(f"Saved checkpoint to {ckpt_path}")
