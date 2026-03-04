@@ -317,16 +317,10 @@ def train():
         rope_theta=args.rope_theta,
         weights=init_weights,
     )
-    if not isinstance(model.lm_head, torch.nn.Parameter):
-        model.lm_head = torch.nn.Parameter(model.lm_head)
     model = model.to(device)
 
-    # Important for this MyTransformerLM implementation:
-    # forward() reads from model.weights["token_embeddings.weight"].
-    # Keep those entries pointing to real Parameters so gradients/updates are preserved.
-    model.weights["token_embeddings.weight"] = model.embedding.weight
-    model.weights["ln_final.weight"] = model.ln_final.weight
-    model.weights["lm_head.weight"] = model.lm_head
+    # LM now follows standard PyTorch behavior:
+    # forward() reads registered module parameters directly.
 
     # Optimizer interface:
     # MyAdamW(params, lr, betas, weight_decay, eps)

@@ -43,10 +43,8 @@ class MyTransformerLM(nn.Module):
                   "layers.{i}.ffn.w3.weight": (d_ff, d_model)
 
         Notes:
-            - This implementation reads token embedding/lm_head source tensors from
-              `self.weights` in `forward`.
-            - For training, caller should keep `self.weights` entries synchronized
-              with real Parameters, otherwise `forward` may overwrite learnable values.
+            - `weights` is treated as an initialization source. After initialization,
+              `forward` uses module parameters directly (standard PyTorch behavior).
         """
         super().__init__()
         self.vocab_size = vocab_size    
@@ -68,16 +66,16 @@ class MyTransformerLM(nn.Module):
             ) for _ in range(num_layers)
         ])
         self.ln_final = MyRMSNorm(d_model)
-        self.ln_final.weight.data = self.weights['ln_final.weight']
-        self.lm_head = self.weights['lm_head.weight']
+        self.lm_head = nn.Parameter(torch.empty(vocab_size, d_model))
 
         self._load_weights(weights)
         
     def _load_weights(self, weights: dict[str, torch.Tensor]):
         """Load top-level and per-layer tensors from a flat weight dictionary."""
-        self.embedding.weight.data = weights['token_embeddings.weight']
-        self.ln_final.weight.data = weights['ln_final.weight']
-        self.lm_head.data = weights['lm_head.weight']
+        with torch.no_grad():
+            self.embedding.weight.copy_(weights['token_embeddings.weight'])
+            self.ln_final.weight.copy_(weights['ln_final.weight'])
+            self.lm_head.copy_(weights['lm_head.weight'])
 
         for i,block in enumerate(self.blocks):
             layer_prefix = f'layers.{i}.'
@@ -92,8 +90,6 @@ class MyTransformerLM(nn.Module):
         Returns:
             Logits of shape (batch, sequence_length, vocab_size).
         """
-        # Keep embedding source aligned with external weight mapping.
-        self.embedding.weight.data = self.weights['token_embeddings.weight']
         x = self.embedding(x)
 
         for block in self.blocks:
@@ -103,5 +99,4 @@ class MyTransformerLM(nn.Module):
         x = self.ln_final(x)
         x = einsum(x, self.lm_head, "... d_model, vocab_size d_model -> ... vocab_size")
         return x
-
 
