@@ -16,13 +16,37 @@ class MyTransformerLM(nn.Module):
                  weights: dict[str, torch.Tensor]
                  ):
         """
-        Parameters:
-            vocab_size (int): The number of unique items in the output vocabulary to be predicted.
-            context_length (int): The maximum number of tokens to process at once.
-            d_model (int): The dimensionality of the model embeddings and sublayer outputs.
-            num_layers (int): The number of Transformer layers to use.
-            num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be evenly divisible by `num_heads`.
-            d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
+        Build a pre-norm Transformer language model.
+
+        Args:
+            vocab_size: Vocabulary size of token IDs.
+            context_length: Maximum sequence length supported by this model.
+            num_layers: Number of Transformer blocks.
+            d_model: Hidden dimension.
+            num_heads: Number of attention heads. `d_model % num_heads == 0`.
+            d_ff: Feed-forward hidden dimension.
+            rope_theta: RoPE theta.
+            weights: Flat state-dict-like tensor mapping used to initialize all modules.
+                Required keys:
+                - "token_embeddings.weight": (vocab_size, d_model)
+                - "ln_final.weight": (d_model,)
+                - "lm_head.weight": (vocab_size, d_model)
+                - For each layer i in [0, num_layers):
+                  "layers.{i}.attn.q_proj.weight": (d_model, d_model)
+                  "layers.{i}.attn.k_proj.weight": (d_model, d_model)
+                  "layers.{i}.attn.v_proj.weight": (d_model, d_model)
+                  "layers.{i}.attn.output_proj.weight": (d_model, d_model)
+                  "layers.{i}.ln1.weight": (d_model,)
+                  "layers.{i}.ln2.weight": (d_model,)
+                  "layers.{i}.ffn.w1.weight": (d_ff, d_model)
+                  "layers.{i}.ffn.w2.weight": (d_model, d_ff)
+                  "layers.{i}.ffn.w3.weight": (d_ff, d_model)
+
+        Notes:
+            - This implementation reads token embedding/lm_head source tensors from
+              `self.weights` in `forward`.
+            - For training, caller should keep `self.weights` entries synchronized
+              with real Parameters, otherwise `forward` may overwrite learnable values.
         """
         super().__init__()
         self.vocab_size = vocab_size    
@@ -50,6 +74,7 @@ class MyTransformerLM(nn.Module):
         self._load_weights(weights)
         
     def _load_weights(self, weights: dict[str, torch.Tensor]):
+        """Load top-level and per-layer tensors from a flat weight dictionary."""
         self.embedding.weight.data = weights['token_embeddings.weight']
         self.ln_final.weight.data = weights['ln_final.weight']
         self.lm_head.data = weights['lm_head.weight']
@@ -61,17 +86,22 @@ class MyTransformerLM(nn.Module):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # embedding layer
+        """
+        Args:
+            x: Token IDs of shape (batch, sequence_length).
+        Returns:
+            Logits of shape (batch, sequence_length, vocab_size).
+        """
+        # Keep embedding source aligned with external weight mapping.
         self.embedding.weight.data = self.weights['token_embeddings.weight']
         x = self.embedding(x)
 
         for block in self.blocks:
             x = block(x)
 
-        # Final layer norm
+        # Final normalization + tied output projection.
         x = self.ln_final(x)
         x = einsum(x, self.lm_head, "... d_model, vocab_size d_model -> ... vocab_size")
-        # x = softmax(x, dim=-1)
         return x
 
 

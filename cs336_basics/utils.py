@@ -173,6 +173,18 @@ def load_checkpoint(src, model, optimizer):
     return iteration
 
 def train():
+    """
+    End-to-end training entry for Assignment 1 section 5.3.
+
+    This function wires together:
+    - MyTransformerLM: language model forward pass -> logits
+    - cross_entropy: logits + next-token labels -> scalar loss
+    - MyAdamW: parameter update
+    - lr_cosine_schedule: per-step learning-rate schedule
+    - gradient_clipping: global gradient norm clipping
+    - get_batch: random (x, y) language-model batch sampling
+    - save_checkpoint / load_checkpoint: training state persistence
+    """
     parser = argparse.ArgumentParser(description="Train a Transformer language model.")
     # Model hyperparameters
     parser.add_argument("--vocab_size", type=int, default=10000)
@@ -205,9 +217,14 @@ def train():
     parser.add_argument("--save_interval", type=int, default=500)
     args = parser.parse_args()
 
+    # Deterministic-ish initialization for reproducibility.
+    # (Full determinism may still require additional backend flags.)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Device selection:
+    # - Use requested device when available
+    # - Fallback to CPU if CUDA/MPS is unavailable
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU.")
         device = torch.device("cpu")
@@ -232,10 +249,15 @@ def train():
     if min_learning_rate is None:
         min_learning_rate = args.learning_rate * 0.1
 
+    # Dataset interface expected by get_batch:
+    # - 1D integer token array (np.ndarray or np.memmap)
+    # - each element is a token id
     ext = os.path.splitext(args.data_path)[1].lower()
     if ext == ".npy":
+        # npy supports shape metadata, load as memory-mapped when possible.
         data = np.load(args.data_path, mmap_mode="r")
     elif ext == ".bin":
+        # raw bin requires explicit dtype; memory-map avoids loading whole corpus.
         dtype_map = {
             "uint16": np.uint16,
             "int32": np.int32,
@@ -252,16 +274,27 @@ def train():
 
     d_ff = 4 * args.d_model
 
+    # Parameter initialization helper for matrix weights.
+    # Tensor shape contracts must match MyTransformerLM/MyTransformerBlock expectations.
     def init_matrix(shape: tuple[int, ...]) -> Tensor:
         t = torch.empty(shape, dtype=torch.float32)
         torch.nn.init.xavier_uniform_(t)
         return t
 
+    # Flat weight dictionary consumed by MyTransformerLM(weights=...).
+    # Required top-level keys:
+    # - token_embeddings.weight: (vocab_size, d_model)
+    # - ln_final.weight: (d_model,)
+    # - lm_head.weight: (vocab_size, d_model)
     init_weights: dict[str, Tensor] = {
         "token_embeddings.weight": init_matrix((args.vocab_size, args.d_model)),
         "ln_final.weight": torch.ones(args.d_model, dtype=torch.float32),
         "lm_head.weight": torch.nn.Parameter(init_matrix((args.vocab_size, args.d_model))),
     }
+    # Required per-layer keys for MyTransformerBlock.load_weights(...):
+    # - attn.{q,k,v,output}_proj.weight
+    # - ln1.weight, ln2.weight
+    # - ffn.w{1,2,3}.weight
     for layer_idx in range(args.num_layers):
         prefix = f"layers.{layer_idx}."
         init_weights[prefix + "attn.q_proj.weight"] = init_matrix((args.d_model, args.d_model))
@@ -288,11 +321,15 @@ def train():
         model.lm_head = torch.nn.Parameter(model.lm_head)
     model = model.to(device)
 
-    # Keep references aligned because MyTransformerLM.forward reads from model.weights.
+    # Important for this MyTransformerLM implementation:
+    # forward() reads from model.weights["token_embeddings.weight"].
+    # Keep those entries pointing to real Parameters so gradients/updates are preserved.
     model.weights["token_embeddings.weight"] = model.embedding.weight
     model.weights["ln_final.weight"] = model.ln_final.weight
     model.weights["lm_head.weight"] = model.lm_head
 
+    # Optimizer interface:
+    # MyAdamW(params, lr, betas, weight_decay, eps)
     optimizer = MyAdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -304,7 +341,12 @@ def train():
     os.makedirs(args.out_dir, exist_ok=True)
     start_iter = 0
     if args.resume_from is not None:
+        # load_checkpoint restores:
+        # - model.state_dict()
+        # - optimizer.state_dict()
+        # - iteration (returned)
         start_iter = load_checkpoint(args.resume_from, model, optimizer) + 1
+        # If checkpoint was loaded on CPU, move optimizer state tensors to target device.
         for state in optimizer.state.values():
             for key, value in state.items():
                 if torch.is_tensor(value):
@@ -313,6 +355,7 @@ def train():
 
     model.train()
     for step in range(start_iter, args.max_iters):
+        # Per-step LR from linear warmup + cosine decay schedule.
         lr = lr_cosine_schedule(
             t=step,
             max_lr=args.learning_rate,
@@ -323,17 +366,23 @@ def train():
         for group in optimizer.param_groups:
             group["lr"] = lr
 
+        # get_batch returns:
+        # - x: (batch_size, context_length), token ids
+        # - y: (batch_size, context_length), next-token labels
         x, y = get_batch(
             data=data,
             batch_size=args.batch_size,
             context_length=args.context_length,
             device=device,
         )
+        # MyTransformerLM(x) -> logits: (batch_size, context_length, vocab_size)
         logits = model(x)
+        # cross_entropy supports arbitrary batch shape [..., vocab_size] + [...]
         loss = cross_entropy(logits, y)
 
         optimizer.zero_grad()
         loss.backward()
+        # Global gradient clipping before optimizer step.
         if args.grad_clip > 0:
             gradient_clipping(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -342,6 +391,7 @@ def train():
             print(f"step {step + 1}/{args.max_iters} | loss {loss.item():.6f} | lr {lr:.8f}")
 
         if (step + 1) % args.save_interval == 0 or (step + 1) == args.max_iters:
+            # save_checkpoint serializes model state, optimizer state, and current iteration.
             ckpt_path = os.path.join(args.out_dir, f"checkpoint_step_{step + 1}.pt")
             save_checkpoint(model=model, optimizer=optimizer, iteration=step, out=ckpt_path)
             print(f"Saved checkpoint to {ckpt_path}")
