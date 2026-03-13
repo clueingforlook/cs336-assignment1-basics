@@ -13,6 +13,10 @@ class MyTransformerBlock(nn.Module):
         max_seq_len: int,
         theta: float,
         eps: float = 1e-5,
+        norm_type: str = "rmsnorm",
+        norm_style: str = "pre",
+        pos_encoding_type: str = "rope",
+        ffn_type: str = "swiglu",
     ):
         """
         Parameters:
@@ -29,17 +33,31 @@ class MyTransformerBlock(nn.Module):
         self.d_ff = d_ff
         self.max_seq_len = max_seq_len
         self.theta = theta
+        self.norm_type = norm_type
+        self.norm_style = norm_style
+        self.pos_encoding_type = pos_encoding_type
+        self.ffn_type = ffn_type
+
+        if self.norm_type not in {"rmsnorm", "none"}:
+            raise ValueError(f"Unsupported norm_type: {self.norm_type}")
+        if self.norm_style not in {"pre", "post"}:
+            raise ValueError(f"Unsupported norm_style: {self.norm_style}")
+        if self.pos_encoding_type not in {"rope", "nope"}:
+            raise ValueError(f"Unsupported pos_encoding_type: {self.pos_encoding_type}")
+        if self.ffn_type not in {"swiglu", "silu"}:
+            raise ValueError(f"Unsupported ffn_type: {self.ffn_type}")
 
         from cs336_basics.MyRMSNorm import MyRMSNorm
         from cs336_basics.MySwiGLU import MySwiGLU
+        from cs336_basics.MySiLUFFN import MySiLUFFN
 
-        self.ln1 = MyRMSNorm(d_model, eps=eps)
+        self.ln1 = MyRMSNorm(d_model, eps=eps) if self.norm_type == "rmsnorm" else nn.Identity()
         self.q_proj_weight = nn.Parameter(torch.empty(d_model, d_model))
         self.k_proj_weight = nn.Parameter(torch.empty(d_model, d_model))
         self.v_proj_weight = nn.Parameter(torch.empty(d_model, d_model))
         self.o_proj_weight = nn.Parameter(torch.empty(d_model, d_model))
-        self.ln2 = MyRMSNorm(d_model, eps=eps)
-        self.ffn = MySwiGLU(d_model, d_ff)
+        self.ln2 = MyRMSNorm(d_model, eps=eps) if self.norm_type == "rmsnorm" else nn.Identity()
+        self.ffn = MySwiGLU(d_model, d_ff) if self.ffn_type == "swiglu" else MySiLUFFN(d_model, d_ff)
 
     def _normalize_ffn_weights(self, w1: Tensor, w2: Tensor, w3: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         # Internal MySwiGLU layout is (d_ff, d_model), (d_model, d_ff), (d_ff, d_model).
@@ -71,63 +89,95 @@ class MyTransformerBlock(nn.Module):
         k = weights.get("attn.k_proj.weight", weights.get("k_proj_weight"))
         v = weights.get("attn.v_proj.weight", weights.get("v_proj_weight"))
         o = weights.get("attn.output_proj.weight", weights.get("o_proj_weight"))
-        ln1_w = weights.get("ln1.weight", weights.get("ln1_weight"))
-        ln2_w = weights.get("ln2.weight", weights.get("ln2_weight"))
         w1 = weights.get("ffn.w1.weight", weights.get("ffn_w_1"))
         w2 = weights.get("ffn.w2.weight", weights.get("ffn_w_2"))
-        w3 = weights.get("ffn.w3.weight", weights.get("ffn_w_3"))
 
-        missing = [
-            key
-            for key, value in {
-                "q_proj": q,
-                "k_proj": k,
-                "v_proj": v,
-                "o_proj": o,
-                "ln1": ln1_w,
-                "ln2": ln2_w,
-                "ffn.w1": w1,
-                "ffn.w2": w2,
-                "ffn.w3": w3,
-            }.items()
-            if value is None
-        ]
+        required_weights = {
+            "q_proj": q,
+            "k_proj": k,
+            "v_proj": v,
+            "o_proj": o,
+            "ffn.w1": w1,
+            "ffn.w2": w2,
+        }
+        ln1_w = None
+        ln2_w = None
+        w3 = None
+        if self.norm_type == "rmsnorm":
+            ln1_w = weights.get("ln1.weight", weights.get("ln1_weight"))
+            ln2_w = weights.get("ln2.weight", weights.get("ln2_weight"))
+            required_weights["ln1"] = ln1_w
+            required_weights["ln2"] = ln2_w
+        if self.ffn_type == "swiglu":
+            w3 = weights.get("ffn.w3.weight", weights.get("ffn_w_3"))
+            required_weights["ffn.w3"] = w3
+
+        missing = [key for key, value in required_weights.items() if value is None]
         if missing:
             raise KeyError(f"Missing required keys in weights: {missing}")
 
-        w1, w2, w3 = self._normalize_ffn_weights(w1, w2, w3)
+        if self.ffn_type == "swiglu":
+            w1, w2, w3 = self._normalize_ffn_weights(w1, w2, w3)
 
         with torch.no_grad():
             self.q_proj_weight.copy_(q)
             self.k_proj_weight.copy_(k)
             self.v_proj_weight.copy_(v)
             self.o_proj_weight.copy_(o)
-            self.ln1.weight.copy_(ln1_w)
-            self.ln2.weight.copy_(ln2_w)
+            if self.norm_type == "rmsnorm":
+                self.ln1.weight.copy_(ln1_w)
+                self.ln2.weight.copy_(ln2_w)
             self.ffn.w_1.copy_(w1)
             self.ffn.w_2.copy_(w2)
-            self.ffn.w_3.copy_(w3)
+            if self.ffn_type == "swiglu":
+                self.ffn.w_3.copy_(w3)
+
+    def _run_attention(
+        self,
+        in_features: Float[Tensor, " batch sequence_length d_model"],
+        token_positions: Int[Tensor, " batch sequence_length"] | None = None,
+    ) -> Float[Tensor, " batch sequence_length d_model"]:
+        from cs336_basics.runCausalMultiHeadSelfAttention import (
+            run_multihead_self_attention,
+            run_multihead_self_attention_with_rope,
+        )
+
+        if self.pos_encoding_type == "rope":
+            return run_multihead_self_attention_with_rope(
+                d_model=self.d_model,
+                num_heads=self.num_heads,
+                max_seq_len=self.max_seq_len,
+                theta=self.theta,
+                q_proj_weight=self.q_proj_weight,
+                k_proj_weight=self.k_proj_weight,
+                v_proj_weight=self.v_proj_weight,
+                o_proj_weight=self.o_proj_weight,
+                in_features=in_features,
+                token_positions=token_positions,
+            )
+        return run_multihead_self_attention(
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            q_proj_weight=self.q_proj_weight,
+            k_proj_weight=self.k_proj_weight,
+            v_proj_weight=self.v_proj_weight,
+            o_proj_weight=self.o_proj_weight,
+            in_features=in_features,
+        )
 
     def forward(
         self,
         in_features: Float[Tensor, " batch sequence_length d_model"],
         token_positions: Int[Tensor, " batch sequence_length"] | None = None,
     ) -> Float[Tensor, " batch sequence_length d_model"]:
-        from cs336_basics.runCausalMultiHeadSelfAttention import run_multihead_self_attention_with_rope
-
         x = in_features
-        attn_out = run_multihead_self_attention_with_rope(
-            d_model=self.d_model,
-            num_heads=self.num_heads,
-            max_seq_len=self.max_seq_len,
-            theta=self.theta,
-            q_proj_weight=self.q_proj_weight,
-            k_proj_weight=self.k_proj_weight,
-            v_proj_weight=self.v_proj_weight,
-            o_proj_weight=self.o_proj_weight,
-            in_features=self.ln1(x),
-            token_positions=token_positions,
-        )
-        x = x + attn_out
-        x = x + self.ffn(self.ln2(x))
+        if self.norm_style == "pre":
+            attn_out = self._run_attention(self.ln1(x), token_positions=token_positions)
+            x = x + attn_out
+            x = x + self.ffn(self.ln2(x))
+            return x
+
+        attn_out = self._run_attention(x, token_positions=token_positions)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ffn(x))
         return x

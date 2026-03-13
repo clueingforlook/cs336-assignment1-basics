@@ -13,7 +13,11 @@ class MyTransformerLM(nn.Module):
                  num_heads: int, 
                  d_ff: int, 
                  rope_theta: float,
-                 weights: dict[str, torch.Tensor]
+                 weights: dict[str, torch.Tensor],
+                 norm_type: str = "rmsnorm",
+                 norm_style: str = "pre",
+                 pos_encoding_type: str = "rope",
+                 ffn_type: str = "swiglu",
                  ):
         """
         Build a pre-norm Transformer language model.
@@ -54,6 +58,10 @@ class MyTransformerLM(nn.Module):
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.rope_theta = rope_theta
+        self.norm_type = norm_type
+        self.norm_style = norm_style
+        self.pos_encoding_type = pos_encoding_type
+        self.ffn_type = ffn_type
         self.weights = weights
         self.embedding = MyEmbedding(vocab_size, d_model)
         self.blocks = nn.ModuleList([
@@ -63,9 +71,13 @@ class MyTransformerLM(nn.Module):
                 d_ff=d_ff,
                 max_seq_len=context_length,
                 theta=rope_theta,
+                norm_type=norm_type,
+                norm_style=norm_style,
+                pos_encoding_type=pos_encoding_type,
+                ffn_type=ffn_type,
             ) for _ in range(num_layers)
         ])
-        self.ln_final = MyRMSNorm(d_model)
+        self.ln_final = MyRMSNorm(d_model) if self.norm_type == "rmsnorm" else nn.Identity()
         self.lm_head = nn.Parameter(torch.empty(vocab_size, d_model))
 
         self._load_weights(weights)
@@ -74,7 +86,8 @@ class MyTransformerLM(nn.Module):
         """Load top-level and per-layer tensors from a flat weight dictionary."""
         with torch.no_grad():
             self.embedding.weight.copy_(weights['token_embeddings.weight'])
-            self.ln_final.weight.copy_(weights['ln_final.weight'])
+            if self.norm_type == "rmsnorm":
+                self.ln_final.weight.copy_(weights['ln_final.weight'])
             self.lm_head.copy_(weights['lm_head.weight'])
 
         for i,block in enumerate(self.blocks):
@@ -99,4 +112,3 @@ class MyTransformerLM(nn.Module):
         x = self.ln_final(x)
         x = einsum(x, self.lm_head, "... d_model, vocab_size d_model -> ... vocab_size")
         return x
-
