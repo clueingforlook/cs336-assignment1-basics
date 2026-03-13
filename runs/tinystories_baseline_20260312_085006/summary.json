@@ -1,0 +1,7 @@
+{
+  "run_dir": "runs/tinystories_baseline_20260312_085006",
+  "total_wallclock_sec": 383.3433870409999,
+  "best_val_loss": 1.811100035905838,
+  "best_step": 4600,
+  "finished_at_utc": "2026-03-12T08:56:30"
+}
