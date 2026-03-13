@@ -1,8 +1,8 @@
 {
-  "input_txt": ".\\data\\TinyStoriesV2-GPT4-valid.txt",
-  "output_bin": ".\\data\\tinystories_valid.bin",
-  "vocab_json": ".\\tinystories_tokenizer_vocab.json",
-  "merges_json": ".\\tinystories_tokenizer_merges.json",
+  "input_txt": "./data/TinyStoriesV2-GPT4-valid.txt",
+  "output_bin": "./data/tinystories_valid.bin",
+  "vocab_json": "./tinystories_tokenizer_vocab.json",
+  "merges_json": "./tinystories_tokenizer_merges.json",
   "dtype": "uint16",
   "special_tokens": ["<|endoftext|>"]
 }

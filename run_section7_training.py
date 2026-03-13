@@ -55,7 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--rope_theta", type=float, default=10000.0)
+    parser.add_argument("--norm_type", type=str, default="rmsnorm", choices=["rmsnorm", "none"])
+    parser.add_argument("--norm_style", type=str, default="pre", choices=["pre", "post"])
+    parser.add_argument("--pos_encoding_type", type=str, default="rope", choices=["rope", "nope"])
+    parser.add_argument("--ffn_type", type=str, default="swiglu", choices=["swiglu", "silu"])
 
     # Training
     parser.add_argument("--batch_size", type=int, default=32)
@@ -119,12 +124,13 @@ def init_matrix(shape: tuple[int, ...]) -> Tensor:
 
 
 def build_model(args: argparse.Namespace, device: torch.device) -> MyTransformerLM:
-    d_ff = 4 * args.d_model
+    d_ff = args.d_ff if args.d_ff is not None else 4 * args.d_model
     init_weights: dict[str, Tensor] = {
         "token_embeddings.weight": init_matrix((args.vocab_size, args.d_model)),
-        "ln_final.weight": torch.ones(args.d_model, dtype=torch.float32),
         "lm_head.weight": init_matrix((args.vocab_size, args.d_model)),
     }
+    if args.norm_type == "rmsnorm":
+        init_weights["ln_final.weight"] = torch.ones(args.d_model, dtype=torch.float32)
 
     for layer_idx in range(args.num_layers):
         prefix = f"layers.{layer_idx}."
@@ -132,11 +138,13 @@ def build_model(args: argparse.Namespace, device: torch.device) -> MyTransformer
         init_weights[prefix + "attn.k_proj.weight"] = init_matrix((args.d_model, args.d_model))
         init_weights[prefix + "attn.v_proj.weight"] = init_matrix((args.d_model, args.d_model))
         init_weights[prefix + "attn.output_proj.weight"] = init_matrix((args.d_model, args.d_model))
-        init_weights[prefix + "ln1.weight"] = torch.ones(args.d_model, dtype=torch.float32)
-        init_weights[prefix + "ln2.weight"] = torch.ones(args.d_model, dtype=torch.float32)
+        if args.norm_type == "rmsnorm":
+            init_weights[prefix + "ln1.weight"] = torch.ones(args.d_model, dtype=torch.float32)
+            init_weights[prefix + "ln2.weight"] = torch.ones(args.d_model, dtype=torch.float32)
         init_weights[prefix + "ffn.w1.weight"] = init_matrix((d_ff, args.d_model))
         init_weights[prefix + "ffn.w2.weight"] = init_matrix((args.d_model, d_ff))
-        init_weights[prefix + "ffn.w3.weight"] = init_matrix((d_ff, args.d_model))
+        if args.ffn_type == "swiglu":
+            init_weights[prefix + "ffn.w3.weight"] = init_matrix((d_ff, args.d_model))
 
     model = MyTransformerLM(
         vocab_size=args.vocab_size,
@@ -147,6 +155,10 @@ def build_model(args: argparse.Namespace, device: torch.device) -> MyTransformer
         d_ff=d_ff,
         rope_theta=args.rope_theta,
         weights=init_weights,
+        norm_type=args.norm_type,
+        norm_style=args.norm_style,
+        pos_encoding_type=args.pos_encoding_type,
+        ffn_type=args.ffn_type,
     )
     return model.to(device)
 
